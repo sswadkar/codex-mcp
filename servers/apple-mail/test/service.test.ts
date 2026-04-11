@@ -37,10 +37,14 @@ describe("AppleMailService", () => {
       messageId: null,
       mailbox: "Drafts",
       account: "Personal",
+      from: {
+        address: "me@example.com",
+      },
       subject: "Hello",
       to: [],
       cc: [],
       bcc: [],
+      attachments: [],
       bodyText: "Test",
     }));
     const service = new AppleMailService({
@@ -57,6 +61,54 @@ describe("AppleMailService", () => {
       appleMailId: "draft-1",
       subject: "Hello",
       bodyText: "Test",
+    });
+  });
+
+  it("passes account, sender, and attachments through on draft creation", async () => {
+    const call = vi.fn(async () => ({
+      appleMailId: "draft-2",
+      messageId: null,
+      mailbox: "Drafts",
+      account: "Personal",
+      from: {
+        address: "me@example.com",
+      },
+      subject: "With files",
+      to: [],
+      cc: [],
+      bcc: [],
+      attachments: [
+        {
+          name: "note.txt",
+          path: "/tmp/note.txt",
+        },
+      ],
+      bodyText: "Attached",
+    }));
+    const service = new AppleMailService({
+      call,
+    } as unknown as BridgeClient<AppleMailBridgeOperations>);
+
+    await service.createDraft({
+      account: "Personal",
+      from: "me@example.com",
+      to: [],
+      cc: [],
+      bcc: [],
+      attachments: ["/tmp/note.txt"],
+      subject: "With files",
+      bodyText: "Attached",
+    });
+
+    expect(call).toHaveBeenCalledWith("createDraft", {
+      account: "Personal",
+      from: "me@example.com",
+      to: [],
+      cc: [],
+      bcc: [],
+      attachments: ["/tmp/note.txt"],
+      subject: "With files",
+      bodyText: "Attached",
     });
   });
 });

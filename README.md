@@ -62,4 +62,9 @@ Current tool namespace:
 - `mail.drafts.create`
 - `mail.drafts.update`
 
+Draft create/update currently support:
+
+- explicit sender/account selection via `account` and `from`
+- absolute host file paths for attachments
+
 The server intentionally excludes send/delete/move/flag operations in v1.

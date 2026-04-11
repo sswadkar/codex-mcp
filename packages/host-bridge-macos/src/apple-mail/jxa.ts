@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
+import { constants } from "node:fs";
+import { access } from "node:fs/promises";
 import type {
   MailAddress,
+  MailAttachment,
   MailDraftCreateRequest,
   MailDraftUpdateRequest,
   MailMessagesSearchRequest,
@@ -126,6 +129,7 @@ export class OsaAppleMailGateway implements AppleMailGateway {
   }
 
   async createDraft(input: MailDraftCreateRequest) {
+    await validateAttachmentPaths(input.attachments);
     const result = await this.executor.runAppleScript(buildCreateDraftScript(input));
     const appleMailId = parseDraftMutationId(result);
     return parseDraftReadAppleScriptResponse(
@@ -135,12 +139,23 @@ export class OsaAppleMailGateway implements AppleMailGateway {
   }
 
   async updateDraft(input: MailDraftUpdateRequest) {
+    await validateAttachmentPaths(input.attachments ?? []);
     const result = await this.executor.runAppleScript(buildUpdateDraftScript(input));
     const appleMailId = parseDraftMutationId(result);
     return parseDraftReadAppleScriptResponse(
       await this.executor.runAppleScript(buildGetDraftAppleScript(appleMailId)),
       mailDraftUpdateResponseSchema,
     );
+  }
+}
+
+async function validateAttachmentPaths(paths: string[]): Promise<void> {
+  for (const path of paths) {
+    try {
+      await access(path, constants.R_OK);
+    } catch (error) {
+      throw new BridgeError("ValidationFailed", `Attachment path is not readable: ${path}`, error);
+    }
   }
 }
 
@@ -196,14 +211,17 @@ function parseDraftReadAppleScriptResponse<T>(
 ): T {
   const fieldDelimiter = "\u001e";
   const listDelimiter = "\u001f";
+  const attachmentFieldDelimiter = "\u001d";
   const [
     appleMailId,
     account,
+    fromText,
     subject,
     bodyText,
     toText,
     ccText,
     bccText,
+    attachmentText,
     messageId,
   ] = output.split(fieldDelimiter);
 
@@ -214,17 +232,53 @@ function parseDraftReadAppleScriptResponse<T>(
       .filter(Boolean)
       .map((address) => ({ address }));
 
+  const parseAttachments = (value?: string): MailAttachment[] =>
+    (value ?? "")
+      .split(listDelimiter)
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => {
+        const [name, path] = entry.split(attachmentFieldDelimiter);
+        return {
+          name: name?.trim() || "attachment",
+          path: path?.trim() || null,
+        };
+      });
+
   return schema.parse({
     appleMailId: appleMailId?.trim() ?? "",
     messageId: messageId?.trim() ? messageId.trim() : null,
     mailbox: "Drafts",
     account: account?.trim() || "Unknown",
+    from: parseMailAddressText(fromText),
     subject: subject ?? null,
     to: parseAddresses(toText),
     cc: parseAddresses(ccText),
     bcc: parseAddresses(bccText),
+    attachments: parseAttachments(attachmentText),
     bodyText: bodyText ?? null,
   });
+}
+
+function parseMailAddressText(value?: string): MailAddress | null {
+  const trimmed = value?.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const match = trimmed.match(/^(.*)<([^>]+)>$/);
+  if (!match) {
+    return {
+      address: trimmed,
+    };
+  }
+
+  const name = match[1] ?? "";
+  const address = match[2] ?? "";
+  return {
+    ...(name.trim() ? { name: name.trim() } : {}),
+    address: address.trim(),
+  };
 }
 
 function parseAccountsAppleScriptResponse(output: string) {
@@ -291,6 +345,92 @@ function recipientAddressListLiteral(addresses: MailAddress[]): string {
   const entries = addresses.map((address) => toAppleScriptStringLiteral(address.address));
 
   return `{${entries.join(", ")}}`;
+}
+
+function attachmentPathListLiteral(paths: string[]): string {
+  if (paths.length === 0) {
+    return "{}";
+  }
+
+  const entries = paths.map((path) => toAppleScriptStringLiteral(path));
+  return `{${entries.join(", ")}}`;
+}
+
+function buildResolveAccountBlock(input: {
+  account?: string | undefined;
+  from?: string | undefined;
+}): string {
+  const requestedAccountName = input.account
+    ? toAppleScriptStringLiteral(input.account)
+    : '""';
+  const requestedFromAddress = input.from
+    ? toAppleScriptStringLiteral(input.from)
+    : '""';
+
+  return `
+set requestedAccountName to ${requestedAccountName}
+set requestedFromAddress to ${requestedFromAddress}
+set resolvedAccount to missing value
+
+if requestedAccountName is not "" then
+  repeat with accountRef in accounts
+    try
+      if (name of accountRef as text) is requestedAccountName then
+        set resolvedAccount to accountRef
+        exit repeat
+      end if
+    end try
+  end repeat
+end if
+
+if resolvedAccount is missing value and requestedFromAddress is not "" then
+  repeat with accountRef in accounts
+    set accountEmails to {}
+    try
+      set accountEmails to email addresses of accountRef
+    end try
+
+    repeat with accountEmail in accountEmails
+      if (accountEmail as text) is requestedFromAddress then
+        set resolvedAccount to accountRef
+        exit repeat
+      end if
+    end repeat
+
+    if resolvedAccount is not missing value then
+      exit repeat
+    end if
+  end repeat
+end if
+`;
+}
+
+function buildApplyResolvedSenderBlock(targetVariable: string): string {
+  return `
+if resolvedAccount is not missing value then
+  try
+    set account of ${targetVariable} to resolvedAccount
+  end try
+end if
+
+if requestedFromAddress is not "" then
+  try
+    set sender of ${targetVariable} to requestedFromAddress
+  end try
+end if
+`;
+}
+
+function buildAddAttachmentBlock(targetVariable: string, attachmentPaths: string[]): string {
+  return `
+set attachmentPathsList to ${attachmentPathListLiteral(attachmentPaths)}
+repeat with attachmentPath in attachmentPathsList
+  set attachmentAlias to POSIX file (attachmentPath as text) as alias
+  tell content of ${targetVariable}
+    make new attachment with properties {file name:attachmentAlias} at after the last paragraph
+  end tell
+end repeat
+`;
 }
 
 function buildSharedPrelude(): string {
@@ -563,20 +703,26 @@ function buildGetDraftAppleScript(appleMailId: string): string {
 tell application "Mail"
   set fieldDelimiter to character id 30
   set listDelimiter to character id 31
+  set attachmentFieldDelimiter to character id 29
   set matchingDrafts to (every outgoing message whose id is ${numericDraftId})
   if (count of matchingDrafts) is 0 then error "Can't get draft ${appleMailId.replace(/"/g, '\\"')}"
   set targetDraft to item 1 of matchingDrafts
 
   set accountName to "Unknown"
+  set senderText to ""
   set draftSubject to ""
   set draftBody to ""
   set draftMessageId to ""
   set toAddresses to {}
   set ccAddresses to {}
   set bccAddresses to {}
+  set attachmentRows to {}
 
   try
     set accountName to (name of account of targetDraft as text)
+  end try
+  try
+    set senderText to (sender of targetDraft as text)
   end try
   try
     set draftSubject to (subject of targetDraft as text)
@@ -588,22 +734,52 @@ tell application "Mail"
     set draftMessageId to (message id of targetDraft as text)
   end try
   try
-    set toAddresses to address of every to recipient of targetDraft
+    tell targetDraft
+      repeat with recipientRef in (to recipients)
+        set end of toAddresses to (address of recipientRef as text)
+      end repeat
+    end tell
   end try
   try
-    set ccAddresses to address of every cc recipient of targetDraft
+    tell targetDraft
+      repeat with recipientRef in (cc recipients)
+        set end of ccAddresses to (address of recipientRef as text)
+      end repeat
+    end tell
   end try
   try
-    set bccAddresses to address of every bcc recipient of targetDraft
+    tell targetDraft
+      repeat with recipientRef in (bcc recipients)
+        set end of bccAddresses to (address of recipientRef as text)
+      end repeat
+    end tell
+  end try
+  try
+    tell targetDraft
+      repeat with attachmentRef in (mail attachments)
+        set attachmentName to ""
+        set attachmentPath to ""
+        try
+          set attachmentName to (name of attachmentRef as text)
+        end try
+        try
+          set attachmentPath to POSIX path of (file name of attachmentRef as alias)
+        end try
+
+        set AppleScript's text item delimiters to attachmentFieldDelimiter
+        set end of attachmentRows to attachmentName & attachmentFieldDelimiter & attachmentPath
+      end repeat
+    end tell
   end try
 
   set AppleScript's text item delimiters to listDelimiter
   set toText to toAddresses as text
   set ccText to ccAddresses as text
   set bccText to bccAddresses as text
+  set attachmentText to attachmentRows as text
 
   set AppleScript's text item delimiters to fieldDelimiter
-  return (id of targetDraft as text) & fieldDelimiter & accountName & fieldDelimiter & draftSubject & fieldDelimiter & draftBody & fieldDelimiter & toText & fieldDelimiter & ccText & fieldDelimiter & bccText & fieldDelimiter & draftMessageId
+  return (id of targetDraft as text) & fieldDelimiter & accountName & fieldDelimiter & senderText & fieldDelimiter & draftSubject & fieldDelimiter & draftBody & fieldDelimiter & toText & fieldDelimiter & ccText & fieldDelimiter & bccText & fieldDelimiter & attachmentText & fieldDelimiter & draftMessageId
 end tell
 `;
 }
@@ -615,7 +791,9 @@ set ccRecipientsList to ${recipientAddressListLiteral(input.cc)}
 set bccRecipientsList to ${recipientAddressListLiteral(input.bcc)}
 
 tell application "Mail"
+  ${buildResolveAccountBlock(input)}
   set newMessage to make new outgoing message with properties {visible:false, subject:${toAppleScriptStringLiteral(input.subject)}, content:${toAppleScriptStringLiteral(input.bodyText)}}
+  ${buildApplyResolvedSenderBlock("newMessage")}
   tell newMessage
     repeat with recipientValue in toRecipientsList
       make new to recipient at end of to recipients with properties {address:recipientValue}
@@ -627,13 +805,10 @@ tell application "Mail"
       make new bcc recipient at end of bcc recipients with properties {address:recipientValue}
     end repeat
   end tell
+  ${buildAddAttachmentBlock("newMessage", input.attachments)}
 
   set messageIdentifier to (id of newMessage as text)
-  set accountName to "Unknown"
-  try
-    set accountName to name of account of newMessage
-  end try
-  return messageIdentifier & linefeed & accountName
+  return messageIdentifier
 end tell
 `;
 }
@@ -668,22 +843,33 @@ end tell
 `;
   };
 
+  const updateAttachments = input.attachments
+    ? `
+tell targetDraft
+  try
+    repeat with existingAttachment in (mail attachments)
+      delete existingAttachment
+    end repeat
+  end try
+end tell
+${buildAddAttachmentBlock("targetDraft", input.attachments)}
+`
+    : "";
+
   return `
 tell application "Mail"
+  ${buildResolveAccountBlock(input)}
   set matchingDrafts to (every outgoing message whose id is ${numericDraftId})
   if (count of matchingDrafts) is 0 then error "Can't get draft ${input.appleMailId.replace(/"/g, '\\"')}"
   set targetDraft to item 1 of matchingDrafts
+  ${buildApplyResolvedSenderBlock("targetDraft")}
   ${typeof input.subject === "string" ? `set subject of targetDraft to ${toAppleScriptStringLiteral(input.subject)}` : ""}
   ${typeof input.bodyText === "string" ? `set content of targetDraft to ${toAppleScriptStringLiteral(input.bodyText)}` : ""}
   ${updateRecipients("to", input.to)}
   ${updateRecipients("cc", input.cc)}
   ${updateRecipients("bcc", input.bcc)}
-
-  set accountName to "Unknown"
-  try
-    set accountName to name of account of targetDraft
-  end try
-  return (id of targetDraft as text) & linefeed & accountName
+  ${updateAttachments}
+  return (id of targetDraft as text)
 end tell
 `;
 }

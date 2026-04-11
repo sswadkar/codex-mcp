@@ -5,6 +5,11 @@ export const mailAddressSchema = z.object({
   address: z.string().email(),
 });
 
+export const mailAttachmentSchema = z.object({
+  name: z.string().min(1),
+  path: z.string().min(1).nullable(),
+});
+
 export const mailMessageSummarySchema = z.object({
   appleMailId: z.string().min(1),
   messageId: z.string().min(1).nullable(),
@@ -61,18 +66,36 @@ export const mailMessageGetRequestSchema = z.object({
 export const mailMessageGetResponseSchema = mailMessageSchema;
 
 export const mailDraftCreateRequestSchema = z.object({
+  account: z.string().min(1).optional(),
+  from: z.string().email().optional(),
   to: z.array(mailAddressSchema).default([]),
   cc: z.array(mailAddressSchema).default([]),
   bcc: z.array(mailAddressSchema).default([]),
+  attachments: z
+    .array(
+      z.string().min(1).refine((value) => value.startsWith("/"), {
+        message: "Attachment paths must be absolute",
+      }),
+    )
+    .default([]),
   subject: z.string().max(998).default(""),
   bodyText: z.string().default(""),
 });
 
 export const mailDraftUpdateRequestSchema = z.object({
   appleMailId: z.string().min(1),
+  account: z.string().min(1).optional(),
+  from: z.string().email().optional(),
   to: z.array(mailAddressSchema).optional(),
   cc: z.array(mailAddressSchema).optional(),
   bcc: z.array(mailAddressSchema).optional(),
+  attachments: z
+    .array(
+      z.string().min(1).refine((value) => value.startsWith("/"), {
+        message: "Attachment paths must be absolute",
+      }),
+    )
+    .optional(),
   subject: z.string().max(998).optional(),
   bodyText: z.string().optional(),
 });
@@ -82,10 +105,12 @@ export const mailDraftResponseSchema = z.object({
   messageId: z.string().min(1).nullable(),
   mailbox: z.string().min(1),
   account: z.string().min(1),
+  from: mailAddressSchema.nullable(),
   subject: z.string().nullable(),
   to: z.array(mailAddressSchema),
   cc: z.array(mailAddressSchema),
   bcc: z.array(mailAddressSchema),
+  attachments: z.array(mailAttachmentSchema),
   bodyText: z.string().nullable(),
 });
 export const mailDraftCreateResponseSchema = mailDraftResponseSchema;
@@ -122,6 +147,7 @@ export const bridgeInvokeResponseSchema = z.object({
 });
 
 export type MailAddress = z.infer<typeof mailAddressSchema>;
+export type MailAttachment = z.infer<typeof mailAttachmentSchema>;
 export type MailAccount = z.infer<typeof mailAccountSchema>;
 export type MailMailbox = z.infer<typeof mailMailboxSchema>;
 export type MailMessageSummary = z.infer<typeof mailMessageSummarySchema>;

@@ -31,7 +31,7 @@ Future host-integrated tools such as Finder or Calendar should add more explicit
 
 ### `servers/apple-mail`
 
-HTTP MCP server package that exposes Apple Mail tools under the `mail.*` namespace and delegates all host automation to the macOS bridge.
+HTTP MCP server package that exposes Apple Mail tools under the `mail.*` namespace and delegates all host automation to the macOS bridge. Draft mutation flows support sender/account selection and host-local file attachments.
 
 ## Adding another server
 
